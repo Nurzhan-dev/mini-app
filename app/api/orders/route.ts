@@ -1,5 +1,8 @@
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "../../lib/supabase";
+import { supabaseAdmin } from "../../../lib/supabase";
+import { PRODUCT_PRICES } from "../../../lib/order-catalog";
+import ru from "../../translations/ru.json";
+import kk from "../../translations/kk.json";
 
 type OrderItem = {
   id: number;
@@ -8,27 +11,42 @@ type OrderItem = {
   price: number;
 };
 
-function asNumber(value: unknown, fallback = 0): number {
-  const number = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(number) ? number : fallback;
-}
+function normalizeItems(value: unknown, lang: "ru" | "kk"): OrderItem[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 8) return null;
 
-function normalizeItems(value: unknown): OrderItem[] {
-  if (!Array.isArray(value)) return [];
+  const seenIds = new Set<number>();
+  const catalog = lang === "ru" ? ru.products : kk.products;
+  const items: OrderItem[] = [];
 
-  return value.flatMap((item) => {
-    if (!item || typeof item !== "object") return [];
+  for (const itemValue of value) {
+    if (!itemValue || typeof itemValue !== "object" || Array.isArray(itemValue)) return null;
 
-    const orderItem = item as Record<string, unknown>;
-    const id = asNumber(orderItem.id, 0);
-    const quantity = asNumber(orderItem.quantity, 0);
-    const price = asNumber(orderItem.price, 0);
-    const name = typeof orderItem.name === "string" ? orderItem.name.trim() : "";
+    const item = itemValue as Record<string, unknown>;
+    const id = item.id;
+    const quantity = item.quantity;
+    if (
+      typeof id !== "number" ||
+      !Number.isSafeInteger(id) ||
+      !(id in PRODUCT_PRICES) ||
+      typeof quantity !== "number" ||
+      !Number.isSafeInteger(quantity) ||
+      quantity < 1 ||
+      quantity > 99 ||
+      seenIds.has(id)
+    ) {
+      return null;
+    }
 
-    if (!id || !quantity || !price || !name) return [];
+    seenIds.add(id);
+    items.push({
+      id,
+      name: catalog[id - 1].name,
+      quantity,
+      price: PRODUCT_PRICES[id],
+    });
+  }
 
-    return [{ id, name, quantity, price }];
-  });
+  return items;
 }
 
 function normalizePhone(value: unknown): string {
@@ -106,31 +124,40 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "INVALID_REQUEST" }, { status: 400 });
   }
 
-  if (!body || typeof body !== "object") {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
     return NextResponse.json({ error: "INVALID_REQUEST" }, { status: 400 });
   }
 
   const data = body as Record<string, unknown>;
-  const items = normalizeItems(data.items);
-  const subtotal = asNumber(data.subtotal, 0);
-  const delivery = asNumber(data.delivery, 0);
-  const total = asNumber(data.total, subtotal + delivery);
+  const lang = data.lang === "kk" ? "kk" : "ru";
+  const items = normalizeItems(data.items, lang);
   const phone = normalizePhone(data.phone);
   const address = normalizeAddress(data.address);
+  if (data.deliveryMethod !== "delivery" && data.deliveryMethod !== "pickup") {
+    return NextResponse.json({ error: "INVALID_DELIVERY_METHOD" }, { status: 400 });
+  }
   const deliveryMethod = normalizeDeliveryMethod(data.deliveryMethod);
-  const lang = typeof data.lang === "string" && (data.lang === "ru" || data.lang === "kk") ? data.lang : "ru";
+  const notes = typeof data.notes === "string" ? data.notes.trim() : "";
 
-  if (!items.length) {
-    return NextResponse.json({ error: "EMPTY_ORDER" }, { status: 400 });
+  if (!items) {
+    return NextResponse.json({ error: "INVALID_ITEMS" }, { status: 400 });
   }
 
-  if (!phone) {
+  if (!phone || phone.length > 40) {
     return NextResponse.json({ error: "PHONE_REQUIRED" }, { status: 400 });
   }
 
-  if (deliveryMethod === "delivery" && !address) {
+  if (deliveryMethod === "delivery" && (!address || address.length > 500)) {
     return NextResponse.json({ error: "ADDRESS_REQUIRED" }, { status: 400 });
   }
+
+  if (notes.length > 1000) {
+    return NextResponse.json({ error: "NOTES_TOO_LONG" }, { status: 400 });
+  }
+
+  const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const delivery = subtotal >= 5000 || subtotal === 0 ? 0 : 500;
+  const total = subtotal + delivery;
 
   if (!supabaseAdmin) {
     return NextResponse.json({ error: "SUPABASE_NOT_CONFIGURED" }, { status: 500 });
@@ -150,7 +177,7 @@ export async function POST(request: Request) {
         phone,
         address: deliveryMethod === "delivery" ? address : null,
         delivery_method: deliveryMethod,
-        notes: typeof data.notes === "string" ? data.notes : null,
+        notes: notes || null,
       },
     ])
     .select()
