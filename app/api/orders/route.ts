@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "../../../lib/supabase";
+import { supabaseAdmin } from "../../lib/supabase";
 
 type OrderItem = {
   id: number;
@@ -31,11 +31,27 @@ function normalizeItems(value: unknown): OrderItem[] {
   });
 }
 
+function normalizePhone(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.trim();
+}
+
+function normalizeAddress(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.trim();
+}
+
+function normalizeDeliveryMethod(value: unknown): "delivery" | "pickup" {
+  return value === "pickup" ? "pickup" : "delivery";
+}
+
 async function sendTelegramMessage(order: {
-  id: string;
   total: number;
   subtotal: number;
   delivery: number;
+  phone: string;
+  address: string;
+  deliveryMethod: "delivery" | "pickup";
   items: OrderItem[];
   lang: string;
 }) {
@@ -51,16 +67,19 @@ async function sendTelegramMessage(order: {
     .map((item) => `${item.name} × ${item.quantity} — ${item.price * item.quantity} ₸`)
     .join("\n");
 
+  const deliveryLabel = order.deliveryMethod === "pickup" ? "Самовывоз" : "Доставка";
+  const addressLine = order.address ? `Адрес: ${order.address}` : "Адрес: не указан";
+
   const text = [
-    "🧾 Новый заказ",
-    `ID: ${order.id}`,
-    `Язык: ${order.lang}`,
+    "📦 Новый заказ",
+    `Телефон: ${order.phone || "не указан"}`,
+    `Заказ: ${summary || "—"}`,
+    `Сумма: ${order.total} ₸`,
+    `Способ доставки: ${deliveryLabel}`,
+    addressLine,
     `Подытог: ${order.subtotal} ₸`,
     `Доставка: ${order.delivery} ₸`,
-    `Итого: ${order.total} ₸`,
-    "",
-    "Товары:",
-    summary,
+    `Язык: ${order.lang}`,
   ].join("\n");
 
   const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
@@ -96,10 +115,21 @@ export async function POST(request: Request) {
   const subtotal = asNumber(data.subtotal, 0);
   const delivery = asNumber(data.delivery, 0);
   const total = asNumber(data.total, subtotal + delivery);
+  const phone = normalizePhone(data.phone);
+  const address = normalizeAddress(data.address);
+  const deliveryMethod = normalizeDeliveryMethod(data.deliveryMethod);
   const lang = typeof data.lang === "string" && (data.lang === "ru" || data.lang === "kk") ? data.lang : "ru";
 
   if (!items.length) {
     return NextResponse.json({ error: "EMPTY_ORDER" }, { status: 400 });
+  }
+
+  if (!phone) {
+    return NextResponse.json({ error: "PHONE_REQUIRED" }, { status: 400 });
+  }
+
+  if (deliveryMethod === "delivery" && !address) {
+    return NextResponse.json({ error: "ADDRESS_REQUIRED" }, { status: 400 });
   }
 
   if (!supabaseAdmin) {
@@ -117,8 +147,9 @@ export async function POST(request: Request) {
         delivery,
         total,
         items,
-        customer_name: typeof data.customerName === "string" ? data.customerName : null,
-        phone: typeof data.phone === "string" ? data.phone : null,
+        phone,
+        address: deliveryMethod === "delivery" ? address : null,
+        delivery_method: deliveryMethod,
         notes: typeof data.notes === "string" ? data.notes : null,
       },
     ])
@@ -131,10 +162,12 @@ export async function POST(request: Request) {
   }
 
   await sendTelegramMessage({
-    id: order.id,
     total: order.total,
     subtotal: order.subtotal,
     delivery: order.delivery,
+    phone: order.phone ?? phone,
+    address: order.address ?? address,
+    deliveryMethod: (order.delivery_method as "delivery" | "pickup") ?? deliveryMethod,
     items: Array.isArray(order.items) ? (order.items as OrderItem[]) : items,
     lang,
   });
@@ -143,10 +176,12 @@ export async function POST(request: Request) {
     ok: true,
     message: "ORDER_SAVED",
     order: {
-      id: order.id,
       total: order.total,
       subtotal: order.subtotal,
       delivery: order.delivery,
+      phone: order.phone ?? phone,
+      address: order.address ?? address,
+      deliveryMethod: (order.delivery_method as "delivery" | "pickup") ?? deliveryMethod,
       items: Array.isArray(order.items) ? order.items : items,
     },
   });
