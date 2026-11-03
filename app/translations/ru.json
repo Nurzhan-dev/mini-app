@@ -29,6 +29,12 @@
   "deliveryBrand": "ДОСТАВКА DALA",
   "heroSideNote": "KYRUK · EST. 2024",
   "copyright": "© DALA 2026 · KYRUK",
+  "phoneLabel": "Номер телефона",
+  "phonePlaceholder": "+7 700 000 00 00",
+  "addressLabel": "Адрес доставки",
+  "addressPlaceholder": "Улица, дом, квартира",
+  "notesLabel": "Комментарий к заказу",
+  "notesPlaceholder": "Пожелания к заказу или доставке",
   "chat": {
     "open": "Открыть чат с помощником",
     "close": "Закрыть чат",

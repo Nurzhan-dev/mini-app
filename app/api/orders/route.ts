@@ -69,6 +69,7 @@ async function sendTelegramMessage(order: {
   delivery: number;
   phone: string;
   address: string;
+  notes: string;
   deliveryMethod: "delivery" | "pickup";
   items: OrderItem[];
   lang: string;
@@ -95,6 +96,7 @@ async function sendTelegramMessage(order: {
     `Сумма: ${order.total} ₸`,
     `Способ доставки: ${deliveryLabel}`,
     addressLine,
+    ...(order.notes ? [`Комментарий: ${order.notes}`] : []),
     `Подытог: ${order.subtotal} ₸`,
     `Доставка: ${order.delivery} ₸`,
     `Язык: ${order.lang}`,
@@ -194,6 +196,7 @@ export async function POST(request: Request) {
     delivery: order.delivery,
     phone: order.phone ?? phone,
     address: order.address ?? address,
+    notes: order.notes ?? notes,
     deliveryMethod: (order.delivery_method as "delivery" | "pickup") ?? deliveryMethod,
     items: Array.isArray(order.items) ? (order.items as OrderItem[]) : items,
     lang,

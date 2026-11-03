@@ -65,6 +65,7 @@ export default function Home() {
   const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
   const [phone, setPhone] = useState("");
   const [address, setAddress] = useState("");
+  const [notes, setNotes] = useState("");
   const [deliveryMethod, setDeliveryMethod] = useState<DeliveryMethod>("delivery");
   const t = translations[lang];
   const otherLanguage: Lang = lang === "ru" ? "kk" : "ru";
@@ -158,7 +159,7 @@ export default function Home() {
           phone,
           address: deliveryMethod === "delivery" ? address : "",
           deliveryMethod,
-          notes: "",
+          notes,
         }),
       });
 
@@ -170,6 +171,7 @@ export default function Home() {
       setCart({});
       setPhone("");
       setAddress("");
+      setNotes("");
       setDeliveryMethod("delivery");
       setOrdered(true);
     } catch (error) {
@@ -527,12 +529,14 @@ export default function Home() {
                   </div>
 
                   <div className="order-form">
-                    <label>
-                      <span>{lang === "ru" ? "Номер телефона" : "Телефон нөмірі"}</span>
+                    <label className="order-field">
+                      <span>{t.phoneLabel}</span>
                       <input
+                        type="tel"
+                        autoComplete="tel"
                         value={phone}
                         onChange={(event) => setPhone(event.target.value)}
-                        placeholder={lang === "ru" ? "+7 700 000 00 00" : "+7 700 000 00 00"}
+                        placeholder={t.phonePlaceholder}
                       />
                     </label>
 
@@ -554,16 +558,27 @@ export default function Home() {
                     </div>
 
                     {deliveryMethod === "delivery" && (
-                      <label>
-                        <span>{lang === "ru" ? "Адрес доставки" : "Жеткізу адресі"}</span>
+                      <label className="order-field">
+                        <span>{t.addressLabel}</span>
                         <textarea
                           value={address}
                           onChange={(event) => setAddress(event.target.value)}
-                          rows={3}
-                          placeholder={lang === "ru" ? "Улица, дом, квартира" : "Көшесі, үй, пәтер"}
+                          rows={2}
+                          maxLength={500}
+                          placeholder={t.addressPlaceholder}
                         />
                       </label>
                     )}
+                    <label className="order-field">
+                      <span>{t.notesLabel}</span>
+                      <textarea
+                        value={notes}
+                        onChange={(event) => setNotes(event.target.value)}
+                        rows={2}
+                        maxLength={1000}
+                        placeholder={t.notesPlaceholder}
+                      />
+                    </label>
                   </div>
 
                   <div className="price-row">

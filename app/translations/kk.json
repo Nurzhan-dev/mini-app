@@ -29,6 +29,12 @@
   "deliveryBrand": "DALA ЖЕТКІЗУ",
   "heroSideNote": "ҚҰРЫҚ · 2024 ЖЫЛДАН",
   "copyright": "© DALA 2026 · ҚҰРЫҚ",
+  "phoneLabel": "Телефон нөмірі",
+  "phonePlaceholder": "+7 700 000 00 00",
+  "addressLabel": "Жеткізу мекенжайы",
+  "addressPlaceholder": "Көше, үй, пәтер",
+  "notesLabel": "Тапсырысқа пікір",
+  "notesPlaceholder": "Тапсырыс немесе жеткізу бойынша тілектер",
   "chat": {
     "open": "Көмекшімен чатты ашу",
     "close": "Чатты жабу",
