@@ -78,6 +78,9 @@
 
 @media (max-width: 650px) {
   .cart-panel {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     padding: 20px 16px calc(16px + env(safe-area-inset-bottom));
   }
 
@@ -138,6 +141,20 @@
 
   .checkout-button {
     height: 44px;
+  }
+
+  .cart-items {
+    flex: 0 0 auto;
+    min-height: 112px;
+    max-height: 32dvh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: #b7b9ac transparent;
+  }
+
+  .cart-bottom {
+    flex: 0 0 auto;
   }
 }
 
