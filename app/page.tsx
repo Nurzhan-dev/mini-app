@@ -1,9 +1,9 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import Script from "next/script";
 import {
   ArrowRight,
-  Check,
   Clock3,
   Flame,
   Leaf,
@@ -19,6 +19,7 @@ import ru from "./translations/ru.json";
 import kk from "./translations/kk.json";
 import AiChat from "./components/ai-chat";
 import { PRODUCT_PRICES } from "../lib/order-catalog";
+import { isBusinessOpen } from "../lib/business-hours";
 
 const translations = { ru, kk };
 type Lang = keyof typeof translations;
@@ -34,7 +35,33 @@ type Product = {
 };
 
 type DeliveryMethod = "delivery" | "pickup";
+type SubmittedOrder = {
+  items: Array<{ id: number; name: string; quantity: number; price: number }>;
+  total: number;
+};
 
+type TurnstileApi = {
+  render: (
+    container: HTMLElement,
+    options: {
+      sitekey: string;
+      action: string;
+      callback: (token: string) => void;
+      "error-callback": () => void;
+      "expired-callback": () => void;
+    },
+  ) => string;
+  reset: (widgetId?: string) => void;
+  remove: (widgetId: string) => void;
+};
+
+declare global {
+  interface Window {
+    turnstile?: TurnstileApi;
+  }
+}
+
+const turnstileSiteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY ?? "";
 const productData: Omit<Product, "price">[] = [
   { id: 1, image: "🍔", category: "burgers", popular: true },
   { id: 2, image: "🍜", category: "dishes", popular: true },
@@ -62,11 +89,20 @@ export default function Home() {
   const [cart, setCart] = useState<Record<number, number>>({});
   const [cartOpen, setCartOpen] = useState(false);
   const [ordered, setOrdered] = useState(false);
+  const [orderedDeliveryMethod, setOrderedDeliveryMethod] =
+    useState<DeliveryMethod>("delivery");
+  const [submittedOrder, setSubmittedOrder] = useState<SubmittedOrder | null>(null);
   const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
   const [phone, setPhone] = useState("");
   const [address, setAddress] = useState("");
   const [notes, setNotes] = useState("");
   const [deliveryMethod, setDeliveryMethod] = useState<DeliveryMethod>("delivery");
+  const [businessOpen, setBusinessOpen] = useState<boolean | null>(null);
+  const [turnstileReady, setTurnstileReady] = useState(false);
+  const [turnstileToken, setTurnstileToken] = useState("");
+  const [turnstileError, setTurnstileError] = useState(false);
+  const turnstileContainerRef = useRef<HTMLDivElement>(null);
+  const turnstileWidgetRef = useRef<string | null>(null);
   const t = translations[lang];
   const otherLanguage: Lang = lang === "ru" ? "kk" : "ru";
   const otherProducts = translations[otherLanguage].products;
@@ -85,6 +121,54 @@ export default function Home() {
     0,
   );
   const delivery = subtotal >= 5000 || subtotal === 0 ? 0 : 500;
+  useEffect(() => {
+    const updateBusinessHours = () => setBusinessOpen(isBusinessOpen());
+    updateBusinessHours();
+    const interval = window.setInterval(updateBusinessHours, 15_000);
+    return () => window.clearInterval(interval);
+  }, []);
+  useEffect(() => {
+    if (
+      !cartOpen ||
+      !turnstileReady ||
+      !turnstileSiteKey ||
+      !turnstileContainerRef.current ||
+      !window.turnstile
+    ) {
+      return;
+    }
+
+    const widgetId = window.turnstile.render(turnstileContainerRef.current, {
+      sitekey: turnstileSiteKey,
+      action: "order",
+      callback: (token) => {
+        setTurnstileToken(token);
+        setTurnstileError(false);
+      },
+      "error-callback": () => {
+        setTurnstileToken("");
+        setTurnstileError(true);
+      },
+      "expired-callback": () => {
+        setTurnstileToken("");
+      },
+    });
+    turnstileWidgetRef.current = widgetId;
+
+    return () => {
+      window.turnstile?.remove(widgetId);
+      turnstileWidgetRef.current = null;
+      setTurnstileToken("");
+    };
+  }, [cartOpen, turnstileReady]);
+
+  const resetTurnstile = () => {
+    setTurnstileToken("");
+    if (turnstileWidgetRef.current) {
+      window.turnstile?.reset(turnstileWidgetRef.current);
+    }
+  };
+
   const money = (amount: number) =>
     `${amount.toLocaleString(lang === "ru" ? "ru-RU" : "kk-KZ")} ₸`;
   const filtered = useMemo(
@@ -99,8 +183,10 @@ export default function Home() {
       ),
     [category, otherProducts, products, query],
   );
-  const add = (id: number, quantity = 1) =>
+  const add = (id: number, quantity = 1) => {
+    setOrdered(false);
     setCart((current) => ({ ...current, [id]: (current[id] ?? 0) + quantity }));
+  };
   const addChatItems = (items: { productId: number; quantity: number }[]) => {
     setCart((current) => {
       const next = { ...current };
@@ -112,7 +198,8 @@ export default function Home() {
     setOrdered(false);
     setCartOpen(true);
   };
-  const change = (id: number, amount: number) =>
+  const change = (id: number, amount: number) => {
+    setOrdered(false);
     setCart((current) => {
       const quantity = (current[id] ?? 0) + amount;
       const next = { ...current };
@@ -120,6 +207,7 @@ export default function Home() {
       else next[id] = quantity;
       return next;
     });
+  };
   const categoryName = (key: Category) => ({
     all: t.all,
     popular: t.popular,
@@ -131,8 +219,25 @@ export default function Home() {
 
   const submitOrder = async () => {
     if (!cartCount || isSubmittingOrder) return;
+    if (businessOpen !== true) {
+      alert(t.closedOrderMessage);
+      return;
+    }
+    if (!turnstileSiteKey) {
+      alert(t.turnstileNotConfigured);
+      return;
+    }
+    if (!turnstileToken) {
+      alert(t.turnstileRequired);
+      return;
+    }
     if (!phone.trim()) {
       alert(lang === "ru" ? "Укажите номер телефона." : "Телефон нөмірін көрсетіңіз.");
+      return;
+    }
+    const normalizedPhone = normalizeKazakhstanPhone(phone);
+    if (!normalizedPhone) {
+      alert(t.phoneInvalid);
       return;
     }
     if (deliveryMethod === "delivery" && !address.trim()) {
@@ -156,10 +261,11 @@ export default function Home() {
         body: JSON.stringify({
           lang,
           items,
-          phone,
+          phone: normalizedPhone,
           address: deliveryMethod === "delivery" ? address : "",
           deliveryMethod,
           notes,
+          turnstileToken,
         }),
       });
 
@@ -168,23 +274,57 @@ export default function Home() {
         throw new Error(result?.error ?? "ORDER_FAILED");
       }
 
+      setSubmittedOrder({
+        items: items.map(({ id, quantity }) => {
+          const product = products[id - 1];
+          return {
+            id,
+            name: product.name,
+            quantity,
+            price: product.price,
+          };
+        }),
+        total: subtotal + delivery,
+      });
       setCart({});
       setPhone("");
       setAddress("");
       setNotes("");
+      setOrderedDeliveryMethod(deliveryMethod);
       setDeliveryMethod("delivery");
       setOrdered(true);
     } catch (error) {
       console.error("Order submit failed", error);
       setOrdered(false);
-      alert(lang === "ru" ? "Не удалось сохранить заказ. Проверьте настройки Supabase и Telegram." : "Тапсырыс сақталмады. Supabase және Telegram конфигурациясын тексеріңіз.");
+      const code = error instanceof Error ? error.message : "ORDER_FAILED";
+      const errorMessages: Record<string, string> = {
+        BUSINESS_CLOSED: t.closedOrderMessage,
+        TURNSTILE_INVALID: t.turnstileInvalid,
+        TURNSTILE_UNAVAILABLE: t.turnstileUnavailable,
+        TURNSTILE_NOT_CONFIGURED: t.turnstileNotConfigured,
+      };
+      alert(
+        errorMessages[code] ??
+          (lang === "ru"
+            ? "Не удалось сохранить заказ. Проверьте настройки Supabase и Telegram."
+            : "Тапсырыс сақталмады. Supabase және Telegram конфигурациясын тексеріңіз."),
+      );
     } finally {
+      resetTurnstile();
       setIsSubmittingOrder(false);
     }
   };
 
   return (
     <main className="app-shell">
+      {turnstileSiteKey && (
+        <Script
+          src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+          strategy="afterInteractive"
+          onLoad={() => setTurnstileReady(true)}
+          onError={() => setTurnstileError(true)}
+        />
+      )}
       <header className="topbar">
         <a className="brand" href="#top" aria-label="DALA">
           <span className="brand-mark">
@@ -195,7 +335,8 @@ export default function Home() {
           </span>
         </a>
         <div className="topbar-center">
-          <span className="open-dot" /> {t.openStatus}
+          <span className={`open-dot${businessOpen === false ? " is-closed" : ""}`} />
+          {businessOpen === false ? t.closedStatus : t.openStatus}
         </div>
         <div className="topbar-actions">
           <div className="lang-toggle" aria-label={t.language}>
@@ -217,7 +358,6 @@ export default function Home() {
             className="cart-button"
             onClick={() => {
               setCartOpen(true);
-              setOrdered(false);
             }}
           >
             <ShoppingBag size={17} />
@@ -448,16 +588,36 @@ export default function Home() {
 
             {ordered ? (
               <div className="order-success">
-                <div className="success-icon">
-                  <Check size={28} />
+                <div className="order-pending-clock" aria-hidden="true">
+                  <Clock3 size={28} />
                 </div>
                 <h3>{t.orderReady}</h3>
-                <p>{t.orderHint}</p>
+                <p className="order-preparing">{t.orderPreparing}</p>
+                <p>
+                  {orderedDeliveryMethod === "delivery"
+                    ? t.orderHintDelivery
+                    : t.orderHintPickup}
+                </p>
+                {submittedOrder && (
+                  <div className="submitted-order">
+                    {submittedOrder.items.map((item) => (
+                      <div className="submitted-order-item" key={item.id}>
+                        <span>
+                          {item.name} × {item.quantity}
+                        </span>
+                        <b>{money(item.price * item.quantity)}</b>
+                      </div>
+                    ))}
+                    <div className="submitted-order-total">
+                      <span>{t.orderTotal}</span>
+                      <b>{money(submittedOrder.total)}</b>
+                    </div>
+                  </div>
+                )}
                 <button
                   className="checkout-button"
                   onClick={() => {
                     setCartOpen(false);
-                    setOrdered(false);
                   }}
                 >
                   {t.close}
@@ -529,13 +689,33 @@ export default function Home() {
                   </div>
 
                   <div className="order-form">
+                    {turnstileSiteKey ? (
+                      <>
+                        <div ref={turnstileContainerRef} />
+                        {turnstileError && (
+                          <p className="turnstile-message" role="alert">
+                            {t.turnstileUnavailable}
+                          </p>
+                        )}
+                      </>
+                    ) : (
+                      <p className="turnstile-message" role="alert">
+                        {t.turnstileNotConfigured}
+                      </p>
+                    )}
                     <label className="order-field">
                       <span>{t.phoneLabel}</span>
                       <input
+                        id="order-phone"
+                        name="phone"
                         type="tel"
-                        autoComplete="tel"
+                        inputMode="tel"
+                        autoComplete="tel-national"
                         value={phone}
-                        onChange={(event) => setPhone(event.target.value)}
+                        onChange={(event) =>
+                          setPhone(event.target.value.replace(/\D/g, "").slice(0, 11))
+                        }
+                        maxLength={24}
                         placeholder={t.phonePlaceholder}
                       />
                     </label>
@@ -561,6 +741,9 @@ export default function Home() {
                       <label className="order-field">
                         <span>{t.addressLabel}</span>
                         <textarea
+                          id="order-address"
+                          name="address"
+                          autoComplete="street-address"
                           value={address}
                           onChange={(event) => setAddress(event.target.value)}
                           rows={2}
@@ -572,6 +755,9 @@ export default function Home() {
                     <label className="order-field">
                       <span>{t.notesLabel}</span>
                       <textarea
+                        id="order-notes"
+                        name="order-notes"
+                        autoComplete="off"
                         value={notes}
                         onChange={(event) => setNotes(event.target.value)}
                         rows={2}
@@ -581,10 +767,6 @@ export default function Home() {
                     </label>
                   </div>
 
-                  <div className="price-row">
-                    <span>{t.subtotal}</span>
-                    <b>{money(subtotal)}</b>
-                  </div>
                   <div className="price-row">
                     <span>{t.delivery}</span>
                     <b>{delivery ? money(delivery) : t.free}</b>
@@ -596,13 +778,30 @@ export default function Home() {
                   <button
                     className="checkout-button"
                     onClick={submitOrder}
-                    disabled={isSubmittingOrder}
+                    disabled={
+                      isSubmittingOrder ||
+                      businessOpen !== true ||
+                      !turnstileSiteKey ||
+                      !turnstileToken
+                    }
                   >
-                    {isSubmittingOrder ? (lang === "ru" ? "Отправка..." : "Жіберілуде...") : t.checkout}
+                    {isSubmittingOrder
+                      ? lang === "ru"
+                        ? "Отправка..."
+                        : "Жіберілуде..."
+                      : businessOpen === false
+                        ? t.closedStatus
+                        : t.checkout}
                     <ArrowRight size={17} />
                   </button>
                   <p className="cart-footnote">
-                    <MapPin size={13} /> {t.deliveryArea} · {t.deliveryTime}
+                    {businessOpen === false ? (
+                      t.closedOrderMessage
+                    ) : (
+                      <>
+                        <MapPin size={13} /> {t.deliveryArea} · {t.deliveryTime}
+                      </>
+                    )}
                   </p>
                 </div>
               </>
@@ -613,4 +812,14 @@ export default function Home() {
       <AiChat lang={lang} hidden={cartOpen} onAddToCart={addChatItems} />
     </main>
   );
+}
+
+function normalizeKazakhstanPhone(value: string): string | undefined {
+  const digits = value.replace(/\D/g, "");
+  if (digits.length === 10) return `+7${digits}`;
+  if (digits.length === 11 && digits.startsWith("7")) return `+${digits}`;
+  if (digits.length === 11 && digits.startsWith("8")) {
+    return `+7${digits.slice(1)}`;
+  }
+  return undefined;
 }

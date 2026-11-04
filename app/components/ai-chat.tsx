@@ -9,6 +9,27 @@ type Lang = "ru" | "kk";
 type Message = { role: "user" | "assistant"; content: string };
 type CartAction = { productId: number; quantity: number };
 type ChatCopy = (typeof ru)["chat"];
+type SpeechResultEvent = {
+  results: ArrayLike<ArrayLike<{ transcript: string }>>;
+};
+type SpeechErrorEvent = { error: string };
+type SpeechRecognitionLike = {
+  lang: string;
+  interimResults: boolean;
+  onresult: ((event: SpeechResultEvent) => void) | null;
+  onerror: ((event: SpeechErrorEvent) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+declare global {
+  interface Window {
+    SpeechRecognition?: SpeechRecognitionConstructor;
+    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+  }
+}
 
 const translations: Record<Lang, { chat: ChatCopy }> = { ru, kk };
 
@@ -27,10 +48,13 @@ export default function AiChat({
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [listening, setListening] = useState(false);
-  const [transcribing, setTranscribing] = useState(false);
   const [error, setError] = useState("");
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const inputRef = useRef(input);
+  const voiceBaseRef = useRef("");
+  const voiceTranscriptRef = useRef("");
+  const autoSendVoiceRef = useRef(false);
+  const sendingRef = useRef(false);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -39,134 +63,28 @@ export default function AiChat({
 
   useEffect(
     () => () => {
-      recorderRef.current?.stop();
-      streamRef.current?.getTracks().forEach((track) => track.stop());
+      autoSendVoiceRef.current = false;
+      recognitionRef.current?.stop();
     },
     [],
   );
 
   if (hidden) return null;
 
-  const toggleVoice = async () => {
-    if (recorderRef.current) {
-      recorderRef.current.stop();
-      recorderRef.current = null;
-      setListening(false);
-      setTranscribing(true);
-      return;
-    }
-
-    if (transcribing) return;
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-      setError(t.voiceUnsupported);
-      return;
-    }
-
-    setError("");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      const mimeType = ["audio/webm;codecs=opus", "audio/mp4"].find((type) =>
-        MediaRecorder.isTypeSupported(type),
-      );
-      const recorder = new MediaRecorder(
-        stream,
-        mimeType ? { mimeType } : undefined,
-      );
-      const chunks: Blob[] = [];
-      let recordingFailed = false;
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) chunks.push(event.data);
-      };
-      recorder.onerror = () => {
-        recordingFailed = true;
-        setListening(false);
-        setError(t.voiceError);
-        recorderRef.current = null;
-        stream.getTracks().forEach((track) => track.stop());
-        streamRef.current = null;
-      };
-      recorder.onstop = async () => {
-        recorderRef.current = null;
-        stream.getTracks().forEach((track) => track.stop());
-        streamRef.current = null;
-        setListening(false);
-        if (recordingFailed || chunks.length === 0) {
-          setTranscribing(false);
-          return;
-        }
-
-        setTranscribing(true);
-        try {
-          const audio = new Blob(chunks, {
-            type: recorder.mimeType || chunks[0].type || "audio/webm",
-          });
-          const formData = new FormData();
-          formData.append("audio", audio, "voice");
-          formData.append("lang", lang);
-          const response = await fetch("/api/transcribe", {
-            method: "POST",
-            body: formData,
-          });
-          const result: unknown = await response.json();
-          if (!response.ok || !isTranscriptionResponse(result)) {
-            throw new Error(getErrorCode(result) ?? "TRANSCRIPTION_ERROR");
-          }
-          setInput((current) =>
-            `${current}${current ? " " : ""}${result.text.trim()}`,
-          );
-        } catch (requestError) {
-          const code =
-            requestError instanceof Error
-              ? requestError.message
-              : "TRANSCRIPTION_ERROR";
-          const errorCopy: Record<string, string> = {
-            AI_NOT_CONFIGURED: t.notConfigured,
-            GROQ_AUTH_FAILED: t.groqAuthError,
-            GROQ_RATE_LIMITED: t.groqRateLimitError,
-            GROQ_REQUEST_REJECTED: t.groqRequestError,
-            AUDIO_TOO_LARGE: t.voiceTooLarge,
-            NO_SPEECH: t.voiceNoSpeech,
-            AI_UNAVAILABLE: t.voiceError,
-          };
-          setError(errorCopy[code] ?? t.voiceError);
-        } finally {
-          setTranscribing(false);
-        }
-      };
-
-      recorderRef.current = recorder;
-      recorder.start();
-      setListening(true);
-    } catch (startError) {
-      console.error("Audio recording could not start", startError);
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-      recorderRef.current = null;
-      setListening(false);
-      const name =
-        startError && typeof startError === "object" && "name" in startError
-          ? startError.name
-          : undefined;
-      setError(
-        name === "NotAllowedError" || name === "SecurityError"
-          ? t.voicePermission
-          : t.voiceError,
-      );
-      setTranscribing(false);
-    }
+  const updateInput = (value: string) => {
+    inputRef.current = value;
+    setInput(value);
   };
 
-  const sendMessage = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const content = input.trim();
-    if (!content || sending) return;
+  const submitMessage = async (value: string) => {
+    const content = value.trim();
+    if (!content || sendingRef.current) return;
 
     const nextMessages = [...messages, { role: "user" as const, content }];
     setMessages(nextMessages);
-    setInput("");
+    updateInput("");
     setError("");
+    sendingRef.current = true;
     setSending(true);
 
     try {
@@ -197,7 +115,80 @@ export default function AiChat({
       );
       setError(errorCopy[code] ?? t.chatError);
     } finally {
+      sendingRef.current = false;
       setSending(false);
+    }
+  };
+
+  const sendMessage = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    void submitMessage(inputRef.current);
+  };
+
+  const toggleVoice = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      return;
+    }
+
+    if (sendingRef.current) return;
+    const SpeechRecognition =
+      window.SpeechRecognition ?? window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setError(t.voiceUnsupported);
+      return;
+    }
+
+    setError("");
+    const recognition = new SpeechRecognition();
+    recognition.lang = lang === "ru" ? "ru-RU" : "kk-KZ";
+    recognition.interimResults = false;
+    voiceBaseRef.current = inputRef.current.trim();
+    voiceTranscriptRef.current = "";
+    autoSendVoiceRef.current = true;
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .map((result) => result[0]?.transcript ?? "")
+        .join(" ")
+        .trim();
+      if (transcript) {
+        voiceTranscriptRef.current = transcript;
+        const base = voiceBaseRef.current;
+        updateInput(`${base}${base ? " " : ""}${transcript}`);
+      }
+    };
+    recognition.onerror = (event) => {
+      setListening(false);
+      recognitionRef.current = null;
+      autoSendVoiceRef.current = false;
+      setError(
+        event.error === "not-allowed" || event.error === "service-not-allowed"
+          ? t.voicePermission
+          : event.error === "no-speech"
+            ? t.voiceNoSpeech
+            : t.voiceError,
+      );
+    };
+    recognition.onend = () => {
+      setListening(false);
+      recognitionRef.current = null;
+      const transcript = voiceTranscriptRef.current;
+      if (autoSendVoiceRef.current && transcript) {
+        const base = voiceBaseRef.current;
+        void submitMessage(`${base}${base ? " " : ""}${transcript}`);
+      }
+      autoSendVoiceRef.current = false;
+    };
+    recognitionRef.current = recognition;
+    setListening(true);
+    try {
+      recognition.start();
+    } catch (startError) {
+      console.error("Speech recognition could not start", startError);
+      recognitionRef.current = null;
+      setListening(false);
+      autoSendVoiceRef.current = false;
+      setError(t.voiceError);
     }
   };
 
@@ -248,7 +239,7 @@ export default function AiChat({
                 <button
                   type="button"
                   key={suggestion}
-                  onClick={() => setInput(suggestion)}
+                  onClick={() => updateInput(suggestion)}
                 >
                   {suggestion}
                 </button>
@@ -258,15 +249,11 @@ export default function AiChat({
 
           <div className="ai-chat-compose">
             {error && <p className="ai-chat-error" role="alert">{error}</p>}
-            {(listening || transcribing) && (
-              <p className="ai-chat-listening">
-                {transcribing ? t.transcribing : t.listening}
-              </p>
-            )}
+            {listening && <p className="ai-chat-listening">{t.listening}</p>}
             <form onSubmit={sendMessage}>
               <textarea
                 value={input}
-                onChange={(event) => setInput(event.target.value)}
+                onChange={(event) => updateInput(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
@@ -276,26 +263,22 @@ export default function AiChat({
                 placeholder={t.placeholder}
                 rows={1}
                 aria-label={t.placeholder}
-                disabled={sending}
+                disabled={sending || listening}
               />
               <button
                 type="button"
                 className={`ai-chat-icon-button ${listening ? "is-listening" : ""}`}
-                onClick={() => void toggleVoice()}
-                disabled={transcribing}
-                aria-label={
-                  transcribing ? t.transcribing : listening ? t.stopVoice : t.startVoice
-                }
-                title={
-                  transcribing ? t.transcribing : listening ? t.stopVoice : t.startVoice
-                }
+                onClick={toggleVoice}
+                disabled={sending && !listening}
+                aria-label={listening ? t.stopVoice : t.startVoice}
+                title={listening ? t.stopVoice : t.startVoice}
               >
                 <Mic size={17} />
               </button>
               <button
                 type="submit"
                 className="ai-chat-send"
-                disabled={!input.trim() || sending}
+                disabled={!input.trim() || sending || listening}
                 aria-label={t.send}
                 title={t.send}
               >
@@ -323,16 +306,6 @@ function getErrorCode(value: unknown): string | undefined {
     return typeof value.error === "string" ? value.error : undefined;
   }
   return undefined;
-}
-
-function isTranscriptionResponse(value: unknown): value is { text: string } {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    "text" in value &&
-    typeof value.text === "string" &&
-    value.text.trim().length > 0
-  );
 }
 
 function isChatResponse(

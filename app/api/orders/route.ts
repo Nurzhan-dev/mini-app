@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../lib/supabase";
 import { PRODUCT_PRICES } from "../../../lib/order-catalog";
+import { isBusinessOpen } from "../../../lib/business-hours";
 import ru from "../../translations/ru.json";
 import kk from "../../translations/kk.json";
 
@@ -10,6 +11,46 @@ type OrderItem = {
   quantity: number;
   price: number;
 };
+
+async function verifyTurnstileToken(
+  token: string,
+): Promise<"valid" | "invalid" | "unavailable" | "not_configured"> {
+  const secret = process.env.TURNSTILE_SECRET_KEY;
+  if (!secret) return "not_configured";
+
+  try {
+    const response = await fetch(
+      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ secret, response: token }),
+        cache: "no-store",
+        signal: AbortSignal.timeout(8000),
+      },
+    );
+    if (!response.ok) {
+      console.error("Turnstile verification request failed", response.status);
+      return "unavailable";
+    }
+
+    const result: unknown = await response.json();
+    if (
+      result &&
+      typeof result === "object" &&
+      "success" in result &&
+      result.success === true &&
+      "action" in result &&
+      result.action === "order"
+    ) {
+      return "valid";
+    }
+    return "invalid";
+  } catch (error) {
+    console.error("Turnstile verification could not be completed", error);
+    return "unavailable";
+  }
+}
 
 function normalizeItems(value: unknown, lang: "ru" | "kk"): OrderItem[] | null {
   if (!Array.isArray(value) || value.length === 0 || value.length > 8) return null;
@@ -49,9 +90,15 @@ function normalizeItems(value: unknown, lang: "ru" | "kk"): OrderItem[] | null {
   return items;
 }
 
-function normalizePhone(value: unknown): string {
-  if (typeof value !== "string") return "";
-  return value.trim();
+function normalizePhone(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const digits = value.replace(/\D/g, "");
+  if (digits.length === 10) return `+7${digits}`;
+  if (digits.length === 11 && digits.startsWith("7")) return `+${digits}`;
+  if (digits.length === 11 && digits.startsWith("8")) {
+    return `+7${digits.slice(1)}`;
+  }
+  return null;
 }
 
 function normalizeAddress(value: unknown): string {
@@ -72,7 +119,6 @@ async function sendTelegramMessage(order: {
   notes: string;
   deliveryMethod: "delivery" | "pickup";
   items: OrderItem[];
-  lang: string;
 }) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -83,7 +129,10 @@ async function sendTelegramMessage(order: {
   }
 
   const summary = order.items
-    .map((item) => `${item.name} × ${item.quantity} — ${item.price * item.quantity} ₸`)
+    .map(
+      (item) =>
+        `${ru.products[item.id - 1].name} × ${item.quantity} — ${item.price * item.quantity} ₸`,
+    )
     .join("\n");
 
   const deliveryLabel = order.deliveryMethod === "pickup" ? "Самовывоз" : "Доставка";
@@ -99,7 +148,6 @@ async function sendTelegramMessage(order: {
     ...(order.notes ? [`Комментарий: ${order.notes}`] : []),
     `Подытог: ${order.subtotal} ₸`,
     `Доставка: ${order.delivery} ₸`,
-    `Язык: ${order.lang}`,
   ].join("\n");
 
   const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
@@ -118,6 +166,10 @@ async function sendTelegramMessage(order: {
 }
 
 export async function POST(request: Request) {
+  if (!isBusinessOpen()) {
+    return NextResponse.json({ error: "BUSINESS_CLOSED" }, { status: 403 });
+  }
+
   let body: unknown;
 
   try {
@@ -133,7 +185,9 @@ export async function POST(request: Request) {
   const data = body as Record<string, unknown>;
   const lang = data.lang === "kk" ? "kk" : "ru";
   const items = normalizeItems(data.items, lang);
+  const rawPhone = typeof data.phone === "string" ? data.phone.trim() : "";
   const phone = normalizePhone(data.phone);
+  const turnstileToken = data.turnstileToken;
   const address = normalizeAddress(data.address);
   if (data.deliveryMethod !== "delivery" && data.deliveryMethod !== "pickup") {
     return NextResponse.json({ error: "INVALID_DELIVERY_METHOD" }, { status: 400 });
@@ -145,8 +199,11 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "INVALID_ITEMS" }, { status: 400 });
   }
 
-  if (!phone || phone.length > 40) {
+  if (!rawPhone) {
     return NextResponse.json({ error: "PHONE_REQUIRED" }, { status: 400 });
+  }
+  if (!phone) {
+    return NextResponse.json({ error: "PHONE_INVALID" }, { status: 400 });
   }
 
   if (deliveryMethod === "delivery" && (!address || address.length > 500)) {
@@ -155,6 +212,26 @@ export async function POST(request: Request) {
 
   if (notes.length > 1000) {
     return NextResponse.json({ error: "NOTES_TOO_LONG" }, { status: 400 });
+  }
+
+  if (
+    typeof turnstileToken !== "string" ||
+    turnstileToken.length === 0 ||
+    turnstileToken.length > 2048
+  ) {
+    return NextResponse.json({ error: "TURNSTILE_INVALID" }, { status: 400 });
+  }
+
+  const turnstileResult = await verifyTurnstileToken(turnstileToken);
+  if (turnstileResult !== "valid") {
+    const status = turnstileResult === "invalid" ? 400 : 503;
+    const error =
+      turnstileResult === "invalid"
+        ? "TURNSTILE_INVALID"
+        : turnstileResult === "not_configured"
+          ? "TURNSTILE_NOT_CONFIGURED"
+          : "TURNSTILE_UNAVAILABLE";
+    return NextResponse.json({ error }, { status });
   }
 
   const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
@@ -199,7 +276,6 @@ export async function POST(request: Request) {
     notes: order.notes ?? notes,
     deliveryMethod: (order.delivery_method as "delivery" | "pickup") ?? deliveryMethod,
     items: Array.isArray(order.items) ? (order.items as OrderItem[]) : items,
-    lang,
   });
 
   return NextResponse.json({
