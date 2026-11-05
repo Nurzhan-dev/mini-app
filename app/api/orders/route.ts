@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../lib/supabase";
 import { PRODUCT_PRICES } from "../../../lib/order-catalog";
@@ -11,6 +12,8 @@ type OrderItem = {
   quantity: number;
   price: number;
 };
+
+const maxReceiptSize = 4 * 1024 * 1024;
 
 async function verifyTurnstileToken(
   token: string,
@@ -111,6 +114,7 @@ function normalizeDeliveryMethod(value: unknown): "delivery" | "pickup" {
 }
 
 async function sendTelegramMessage(order: {
+  id: string;
   total: number;
   subtotal: number;
   delivery: number;
@@ -140,6 +144,7 @@ async function sendTelegramMessage(order: {
 
   const text = [
     "📦 Новый заказ",
+    `Заказ №: ${order.id}`,
     `Телефон: ${order.phone || "не указан"}`,
     `Заказ: ${summary || "—"}`,
     `Сумма: ${order.total} ₸`,
@@ -165,15 +170,87 @@ async function sendTelegramMessage(order: {
   }
 }
 
+async function sendTelegramReceipt(receipt: File, orderId: string): Promise<boolean> {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!botToken || !chatId) {
+    console.info("Telegram receipt delivery is disabled. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.");
+    return false;
+  }
+
+  const formData = new FormData();
+  formData.append("chat_id", chatId);
+  formData.append("caption", `Чек предоплаты к заказу № ${orderId}`);
+  formData.append("document", receipt, "receipt.pdf");
+
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${botToken}/sendDocument`,
+      { method: "POST", body: formData },
+    );
+    const payload: unknown = await response.json().catch(() => null);
+    if (
+      !response.ok ||
+      !payload ||
+      typeof payload !== "object" ||
+      !("ok" in payload) ||
+      payload.ok !== true
+    ) {
+      console.error("Telegram sendDocument failed", payload ?? response.statusText);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error("Telegram receipt delivery failed", error);
+    return false;
+  }
+}
+
 export async function POST(request: Request) {
   if (!isBusinessOpen()) {
     return NextResponse.json({ error: "BUSINESS_CLOSED" }, { status: 403 });
   }
 
-  let body: unknown;
+  let formData: FormData;
 
   try {
-    body = await request.json();
+    formData = await request.formData();
+  } catch {
+    return NextResponse.json({ error: "INVALID_REQUEST" }, { status: 400 });
+  }
+
+  const orderPayload = formData.get("order");
+  const receipt = formData.get("receipt");
+  if (
+    typeof orderPayload !== "string" ||
+    typeof File === "undefined" ||
+    !(receipt instanceof File)
+  ) {
+    return NextResponse.json({ error: "RECEIPT_REQUIRED" }, { status: 400 });
+  }
+  if (
+    !receipt.name.toLowerCase().endsWith(".pdf") ||
+    (receipt.type && receipt.type !== "application/pdf")
+  ) {
+    return NextResponse.json({ error: "RECEIPT_INVALID" }, { status: 400 });
+  }
+  if (receipt.size === 0) {
+    return NextResponse.json({ error: "RECEIPT_INVALID" }, { status: 400 });
+  }
+  if (receipt.size > maxReceiptSize) {
+    return NextResponse.json({ error: "RECEIPT_SIZE_INVALID" }, { status: 413 });
+  }
+  const pdfHeader = new Uint8Array(await receipt.slice(0, 5).arrayBuffer());
+  if (
+    pdfHeader.length !== 5 ||
+    String.fromCharCode(...pdfHeader) !== "%PDF-"
+  ) {
+    return NextResponse.json({ error: "RECEIPT_INVALID" }, { status: 400 });
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(orderPayload);
   } catch {
     return NextResponse.json({ error: "INVALID_REQUEST" }, { status: 400 });
   }
@@ -222,6 +299,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "TURNSTILE_INVALID" }, { status: 400 });
   }
 
+  if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) {
+    return NextResponse.json({ error: "TELEGRAM_NOT_CONFIGURED" }, { status: 503 });
+  }
+
   const turnstileResult = await verifyTurnstileToken(turnstileToken);
   if (turnstileResult !== "valid") {
     const status = turnstileResult === "invalid" ? 400 : 503;
@@ -235,17 +316,24 @@ export async function POST(request: Request) {
   }
 
   const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-  const delivery = subtotal >= 5000 || subtotal === 0 ? 0 : 500;
+  const delivery =
+    deliveryMethod === "delivery" && subtotal > 0 && subtotal < 5000 ? 500 : 0;
   const total = subtotal + delivery;
 
   if (!supabaseAdmin) {
     return NextResponse.json({ error: "SUPABASE_NOT_CONFIGURED" }, { status: 500 });
   }
 
+  const orderId = randomUUID();
+  if (!(await sendTelegramReceipt(receipt, orderId))) {
+    return NextResponse.json({ error: "RECEIPT_DELIVERY_FAILED" }, { status: 502 });
+  }
+
   const { data: order, error } = await supabaseAdmin
     .from("orders")
     .insert([
       {
+        id: orderId,
         status: "new",
         source: "mini_app",
         lang,
@@ -268,6 +356,7 @@ export async function POST(request: Request) {
   }
 
   await sendTelegramMessage({
+    id: order.id,
     total: order.total,
     subtotal: order.subtotal,
     delivery: order.delivery,

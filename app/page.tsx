@@ -7,6 +7,7 @@ import {
   Clock3,
   Flame,
   Leaf,
+  LoaderCircle,
   MapPin,
   Minus,
   Plus,
@@ -46,11 +47,15 @@ type TurnstileApi = {
     options: {
       sitekey: string;
       action: string;
+      size: "invisible";
+      execution: "execute";
+      appearance: "execute";
       callback: (token: string) => void;
       "error-callback": () => void;
       "expired-callback": () => void;
     },
   ) => string;
+  execute: (widgetId: string) => void;
   reset: (widgetId?: string) => void;
   remove: (widgetId: string) => void;
 };
@@ -62,6 +67,7 @@ declare global {
 }
 
 const turnstileSiteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY ?? "";
+const maxReceiptSize = 4 * 1024 * 1024;
 const productData: Omit<Product, "price">[] = [
   { id: 1, image: "🍔", category: "burgers", popular: true },
   { id: 2, image: "🍜", category: "dishes", popular: true },
@@ -96,13 +102,20 @@ export default function Home() {
   const [phone, setPhone] = useState("");
   const [address, setAddress] = useState("");
   const [notes, setNotes] = useState("");
+  const [receipt, setReceipt] = useState<File | null>(null);
   const [deliveryMethod, setDeliveryMethod] = useState<DeliveryMethod>("delivery");
   const [businessOpen, setBusinessOpen] = useState<boolean | null>(null);
-  const [turnstileReady, setTurnstileReady] = useState(false);
-  const [turnstileToken, setTurnstileToken] = useState("");
+  const [turnstileScriptReady, setTurnstileScriptReady] = useState(false);
+  const [turnstileWidgetReady, setTurnstileWidgetReady] = useState(false);
   const [turnstileError, setTurnstileError] = useState(false);
+  const [isVerifyingTurnstile, setIsVerifyingTurnstile] = useState(false);
   const turnstileContainerRef = useRef<HTMLDivElement>(null);
+  const receiptInputRef = useRef<HTMLInputElement>(null);
   const turnstileWidgetRef = useRef<string | null>(null);
+  const turnstileResultRef = useRef<{
+    resolve: (token: string) => void;
+    reject: (error: Error) => void;
+  } | null>(null);
   const t = translations[lang];
   const otherLanguage: Lang = lang === "ru" ? "kk" : "ru";
   const otherProducts = translations[otherLanguage].products;
@@ -120,7 +133,8 @@ export default function Home() {
     (sum, product) => sum + product.price * (cart[product.id] ?? 0),
     0,
   );
-  const delivery = subtotal >= 5000 || subtotal === 0 ? 0 : 500;
+  const delivery =
+    deliveryMethod === "delivery" && subtotal > 0 && subtotal < 5000 ? 500 : 0;
   useEffect(() => {
     const updateBusinessHours = () => setBusinessOpen(isBusinessOpen());
     updateBusinessHours();
@@ -129,8 +143,7 @@ export default function Home() {
   }, []);
   useEffect(() => {
     if (
-      !cartOpen ||
-      !turnstileReady ||
+      !turnstileScriptReady ||
       !turnstileSiteKey ||
       !turnstileContainerRef.current ||
       !window.turnstile
@@ -138,36 +151,82 @@ export default function Home() {
       return;
     }
 
-    const widgetId = window.turnstile.render(turnstileContainerRef.current, {
-      sitekey: turnstileSiteKey,
-      action: "order",
-      callback: (token) => {
-        setTurnstileToken(token);
-        setTurnstileError(false);
-      },
-      "error-callback": () => {
-        setTurnstileToken("");
-        setTurnstileError(true);
-      },
-      "expired-callback": () => {
-        setTurnstileToken("");
-      },
-    });
-    turnstileWidgetRef.current = widgetId;
+    try {
+      const widgetId = window.turnstile.render(turnstileContainerRef.current, {
+        sitekey: turnstileSiteKey,
+        action: "order",
+        size: "invisible",
+        execution: "execute",
+        appearance: "execute",
+        callback: (token) => {
+          turnstileResultRef.current?.resolve(token);
+          turnstileResultRef.current = null;
+        },
+        "error-callback": () => {
+          setTurnstileError(true);
+          turnstileResultRef.current?.reject(new Error("TURNSTILE_UNAVAILABLE"));
+          turnstileResultRef.current = null;
+        },
+        "expired-callback": () => {
+          turnstileResultRef.current?.reject(new Error("TURNSTILE_INVALID"));
+          turnstileResultRef.current = null;
+        },
+      });
+      turnstileWidgetRef.current = widgetId;
+      setTurnstileWidgetReady(true);
+      setTurnstileError(false);
+    } catch (error) {
+      console.error("Turnstile widget could not be initialized", error);
+      setTurnstileError(true);
+    }
 
     return () => {
-      window.turnstile?.remove(widgetId);
+      const widgetId = turnstileWidgetRef.current;
+      if (widgetId) window.turnstile?.remove(widgetId);
+      turnstileResultRef.current?.reject(new Error("TURNSTILE_UNAVAILABLE"));
+      turnstileResultRef.current = null;
       turnstileWidgetRef.current = null;
-      setTurnstileToken("");
+      setTurnstileWidgetReady(false);
     };
-  }, [cartOpen, turnstileReady]);
+  }, [turnstileScriptReady]);
 
-  const resetTurnstile = () => {
-    setTurnstileToken("");
-    if (turnstileWidgetRef.current) {
-      window.turnstile?.reset(turnstileWidgetRef.current);
-    }
-  };
+  const requestTurnstileToken = () =>
+    new Promise<string>((resolve, reject) => {
+      const turnstile = window.turnstile;
+      const widgetId = turnstileWidgetRef.current;
+      if (!turnstileScriptReady || !turnstile || !widgetId) {
+        reject(new Error("TURNSTILE_UNAVAILABLE"));
+        return;
+      }
+
+      let settled = false;
+      let timeoutId: number;
+      const finish = () => {
+        if (settled) return false;
+        settled = true;
+        window.clearTimeout(timeoutId);
+        turnstileResultRef.current = null;
+        return true;
+      };
+      const succeed = (token: string) => {
+        if (finish()) resolve(token);
+      };
+      const fail = (error: Error) => {
+        if (finish()) reject(error);
+      };
+      turnstileResultRef.current = { resolve: succeed, reject: fail };
+      timeoutId = window.setTimeout(() => {
+        setTurnstileError(true);
+        fail(new Error("TURNSTILE_UNAVAILABLE"));
+      }, 20_000);
+      setTurnstileError(false);
+      try {
+        turnstile.execute(widgetId);
+      } catch (error) {
+        fail(new Error("TURNSTILE_UNAVAILABLE"));
+        console.error("Turnstile challenge could not start", error);
+      }
+    });
 
   const money = (amount: number) =>
     `${amount.toLocaleString(lang === "ru" ? "ru-RU" : "kk-KZ")} ₸`;
@@ -227,10 +286,6 @@ export default function Home() {
       alert(t.turnstileNotConfigured);
       return;
     }
-    if (!turnstileToken) {
-      alert(t.turnstileRequired);
-      return;
-    }
     if (!phone.trim()) {
       alert(lang === "ru" ? "Укажите номер телефона." : "Телефон нөмірін көрсетіңіз.");
       return;
@@ -244,6 +299,22 @@ export default function Home() {
       alert(lang === "ru" ? "Укажите адрес доставки." : "Жеткізу адресін көрсетіңіз.");
       return;
     }
+    if (!receipt) {
+      alert(t.receiptRequired);
+      return;
+    }
+    if (
+      !receipt.name.toLowerCase().endsWith(".pdf") ||
+      (receipt.type && receipt.type !== "application/pdf") ||
+      receipt.size === 0
+    ) {
+      alert(t.receiptInvalid);
+      return;
+    }
+    if (receipt.size > maxReceiptSize) {
+      alert(t.receiptTooLarge);
+      return;
+    }
 
     const items = products
       .filter((product) => cart[product.id])
@@ -255,18 +326,26 @@ export default function Home() {
     setIsSubmittingOrder(true);
 
     try {
-      const response = await fetch("/api/orders", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      setIsVerifyingTurnstile(true);
+      const token = await requestTurnstileToken();
+      setIsVerifyingTurnstile(false);
+      const formData = new FormData();
+      formData.append(
+        "order",
+        JSON.stringify({
           lang,
           items,
           phone: normalizedPhone,
           address: deliveryMethod === "delivery" ? address : "",
           deliveryMethod,
           notes,
-          turnstileToken,
+          turnstileToken: token,
         }),
+      );
+      formData.append("receipt", receipt, receipt.name);
+      const response = await fetch("/api/orders", {
+        method: "POST",
+        body: formData,
       });
 
       const result = await response.json().catch(() => null);
@@ -290,6 +369,8 @@ export default function Home() {
       setPhone("");
       setAddress("");
       setNotes("");
+      setReceipt(null);
+      if (receiptInputRef.current) receiptInputRef.current.value = "";
       setOrderedDeliveryMethod(deliveryMethod);
       setDeliveryMethod("delivery");
       setOrdered(true);
@@ -302,6 +383,11 @@ export default function Home() {
         TURNSTILE_INVALID: t.turnstileInvalid,
         TURNSTILE_UNAVAILABLE: t.turnstileUnavailable,
         TURNSTILE_NOT_CONFIGURED: t.turnstileNotConfigured,
+        RECEIPT_REQUIRED: t.receiptRequired,
+        RECEIPT_INVALID: t.receiptInvalid,
+        RECEIPT_SIZE_INVALID: t.receiptTooLarge,
+        RECEIPT_DELIVERY_FAILED: t.receiptTelegramUnavailable,
+        TELEGRAM_NOT_CONFIGURED: t.receiptTelegramUnavailable,
       };
       alert(
         errorMessages[code] ??
@@ -310,7 +396,9 @@ export default function Home() {
             : "Тапсырыс сақталмады. Supabase және Telegram конфигурациясын тексеріңіз."),
       );
     } finally {
-      resetTurnstile();
+      setIsVerifyingTurnstile(false);
+      const widgetId = turnstileWidgetRef.current;
+      if (widgetId) window.turnstile?.reset(widgetId);
       setIsSubmittingOrder(false);
     }
   };
@@ -321,8 +409,18 @@ export default function Home() {
         <Script
           src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
           strategy="afterInteractive"
-          onLoad={() => setTurnstileReady(true)}
-          onError={() => setTurnstileError(true)}
+          onLoad={() => setTurnstileScriptReady(true)}
+          onError={() => {
+            setTurnstileScriptReady(false);
+            setTurnstileError(true);
+          }}
+        />
+      )}
+      {turnstileSiteKey && (
+        <div
+          ref={turnstileContainerRef}
+          className="turnstile-invisible-widget"
+          aria-hidden="true"
         />
       )}
       <header className="topbar">
@@ -562,7 +660,12 @@ export default function Home() {
         <div
           className="overlay"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setCartOpen(false);
+            if (
+              !isSubmittingOrder &&
+              event.target === event.currentTarget
+            ) {
+              setCartOpen(false);
+            }
           }}
         >
           <aside className="cart-panel">
@@ -579,6 +682,7 @@ export default function Home() {
               </div>
               <button
                 className="close-button"
+                disabled={isSubmittingOrder}
                 onClick={() => setCartOpen(false)}
                 aria-label={t.closeLabel}
               >
@@ -673,34 +777,32 @@ export default function Home() {
                 </div>
 
                 <div className="cart-bottom">
-                  <div className="delivery-progress">
-                    {subtotal >= 5000 ? (
-                      <>
-                        <span>✦</span> {t.free} · 5 000 ₸+
-                      </>
-                    ) : (
-                      <>
-                        <span>✦</span> {t.deliveryRemaining} {money(5000 - subtotal)}
-                      </>
-                    )}
-                    <div className="progress-track">
-                      <i style={{ width: `${Math.min(100, (subtotal / 5000) * 100)}%` }} />
+                  {deliveryMethod === "delivery" && (
+                    <div className="delivery-progress">
+                      {subtotal >= 5000 ? (
+                        <>
+                          <span>✦</span> {t.free} · 5 000 ₸+
+                        </>
+                      ) : (
+                        <>
+                          <span>✦</span> {t.deliveryRemaining} {money(5000 - subtotal)}
+                        </>
+                      )}
+                      <div className="progress-track">
+                        <i style={{ width: `${Math.min(100, (subtotal / 5000) * 100)}%` }} />
+                      </div>
                     </div>
-                  </div>
+                  )}
 
                   <div className="order-form">
-                    {turnstileSiteKey ? (
-                      <>
-                        <div ref={turnstileContainerRef} />
-                        {turnstileError && (
-                          <p className="turnstile-message" role="alert">
-                            {t.turnstileUnavailable}
-                          </p>
-                        )}
-                      </>
-                    ) : (
+                    {!turnstileSiteKey ? (
                       <p className="turnstile-message" role="alert">
                         {t.turnstileNotConfigured}
+                      </p>
+                    ) : null}
+                    {turnstileError && (
+                      <p className="turnstile-message" role="alert">
+                        {t.turnstileUnavailable}
                       </p>
                     )}
                     <label className="order-field">
@@ -718,6 +820,46 @@ export default function Home() {
                         maxLength={24}
                         placeholder={t.phonePlaceholder}
                       />
+                    </label>
+
+                    <label className="order-field">
+                      <span>{t.receiptLabel}</span>
+                      <input
+                        ref={receiptInputRef}
+                        id="order-receipt"
+                        name="receipt"
+                        type="file"
+                        accept=".pdf,application/pdf"
+                        required
+                        disabled={isSubmittingOrder}
+                        onChange={(event) => {
+                          const file = event.target.files?.[0] ?? null;
+                          if (!file) {
+                            setReceipt(null);
+                            return;
+                          }
+                          if (
+                            !file.name.toLowerCase().endsWith(".pdf") ||
+                            (file.type && file.type !== "application/pdf") ||
+                            file.size === 0
+                          ) {
+                            event.target.value = "";
+                            setReceipt(null);
+                            alert(t.receiptInvalid);
+                            return;
+                          }
+                          if (file.size > maxReceiptSize) {
+                            event.target.value = "";
+                            setReceipt(null);
+                            alert(t.receiptTooLarge);
+                            return;
+                          }
+                          setReceipt(file);
+                        }}
+                      />
+                      <small className="receipt-help">
+                        {receipt ? receipt.name : t.receiptHelp}
+                      </small>
                     </label>
 
                     <div className="delivery-methods">
@@ -767,10 +909,12 @@ export default function Home() {
                     </label>
                   </div>
 
-                  <div className="price-row">
-                    <span>{t.delivery}</span>
-                    <b>{delivery ? money(delivery) : t.free}</b>
-                  </div>
+                  {deliveryMethod === "delivery" && (
+                    <div className="price-row">
+                      <span>{t.delivery}</span>
+                      <b>{delivery ? money(delivery) : t.free}</b>
+                    </div>
+                  )}
                   <div className="price-total">
                     <span>{t.total}</span>
                     <b>{money(subtotal + delivery)}</b>
@@ -781,14 +925,21 @@ export default function Home() {
                     disabled={
                       isSubmittingOrder ||
                       businessOpen !== true ||
-                      !turnstileSiteKey ||
-                      !turnstileToken
+                      !turnstileWidgetReady
                     }
+                    aria-live="polite"
                   >
                     {isSubmittingOrder
-                      ? lang === "ru"
-                        ? "Отправка..."
-                        : "Жіберілуде..."
+                      ? <>
+                          {isVerifyingTurnstile && (
+                            <LoaderCircle className="turnstile-spinner" size={16} />
+                          )}
+                          {isVerifyingTurnstile
+                            ? t.turnstileChecking
+                            : lang === "ru"
+                              ? "Отправка..."
+                              : "Жіберілуде..."}
+                        </>
                       : businessOpen === false
                         ? t.closedStatus
                         : t.checkout}

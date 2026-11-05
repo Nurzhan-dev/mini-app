@@ -92,6 +92,33 @@
   line-height: 1.4;
 }
 
+.turnstile-invisible-widget {
+  position: fixed;
+  z-index: -1;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+
+.turnstile-spinner {
+  flex: 0 0 auto;
+  animation: turnstile-spin 0.9s linear infinite;
+}
+
+@keyframes turnstile-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .turnstile-spinner {
+    animation: none;
+  }
+}
+
 .order-field > span {
   color: #65685f;
   font-size: 10px;
@@ -113,6 +140,18 @@
 
 .order-field input {
   height: 39px;
+}
+
+.order-field input[type="file"] {
+  height: auto;
+  padding: 8px;
+  font-size: 11px;
+}
+
+.receipt-help {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 10px;
 }
 
 .order-field textarea {
